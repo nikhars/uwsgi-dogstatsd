@@ -19,7 +19,6 @@ exports values exposed by the metric subsystem to a Datadog Agent StatsD server
 
 extern struct uwsgi_server uwsgi;
 
-// Fixed entry for storing previous metric values
 struct delta_metric {
     char *metric_name;
     int64_t prev_value;
@@ -32,8 +31,8 @@ struct dogstatsd_config {
     char *extra_tags;
     struct uwsgi_string_list *metrics_whitelist;
     struct uwsgi_string_list *delta_metrics;
-    struct delta_metric *delta_lookup;  // Fixed sorted array
-    uint32_t delta_count;               // Number of delta metrics
+    struct delta_metric *delta_lookup;
+    uint32_t delta_count;
 } u_dogstatsd_config;
 
 static struct uwsgi_option dogstatsd_options[] = {
@@ -54,18 +53,12 @@ struct dogstatsd_node {
   uint16_t prefix_len;
 };
 
-// Compare function for binary search and sorting
-static int compare_metric_names(const char *name1, uint32_t len1, const char *name2, uint32_t len2) {
-  if (len1 == len2) {
-    // Same length - just compare the strings directly
-    return memcmp(name1, name2, len1);
-  } else {
-    // Different lengths - compare common prefix, then use length difference
-    uint32_t min_len = len1 < len2 ? len1 : len2;
-    int cmp = memcmp(name1, name2, min_len);
-    if (cmp != 0) return cmp;
-    return (int)len1 - (int)len2;
-  }
+// Compare function for binary search and quick sort.
+static int metric_names_cmp(const char *name1, uint32_t len1, const char *name2, uint32_t len2) {
+  uint32_t min_len = len1 < len2 ? len1 : len2;
+  int cmp = memcmp(name1, name2, min_len);
+  if (cmp != 0) return cmp;
+  return (int)len1 - (int)len2;
 }
 
 // Search key structure for bsearch
@@ -75,15 +68,16 @@ struct delta_search_key {
 };
 
 // Comparison function for bsearch
-static int compare_for_bsearch(const void *key, const void *element) {
+static int bsearch_cmp(const void *key, const void *element) {
   const struct delta_search_key *search_key = (const struct delta_search_key *)key;
   const struct delta_metric *metric = (const struct delta_metric *)element;
   
-  return compare_metric_names(search_key->metric_name, search_key->name_len, 
+  return metric_names_cmp(search_key->metric_name, search_key->name_len, 
                              metric->metric_name, metric->name_len);
 }
 
-// Binary search using standard library bsearch
+// Binary search using standard library bsearch. We use bsearch because it's
+// available in standard C library.
 static struct delta_metric* find_delta_metric(const char *metric_name, uint32_t name_len) {
   if (!u_dogstatsd_config.delta_lookup || u_dogstatsd_config.delta_count == 0) {
     return NULL;
@@ -95,14 +89,14 @@ static struct delta_metric* find_delta_metric(const char *metric_name, uint32_t 
                                       u_dogstatsd_config.delta_lookup,
                                       u_dogstatsd_config.delta_count,
                                       sizeof(struct delta_metric),
-                                      compare_for_bsearch);
+                                      bsearch_cmp);
 }
 
 // Compare function for qsort
-static int compare_delta_metrics(const void *a, const void *b) {
+static int qsort_cmp(const void *a, const void *b) {
   const struct delta_metric *m1 = (const struct delta_metric *)a;
   const struct delta_metric *m2 = (const struct delta_metric *)b;
-  return compare_metric_names(m1->metric_name, m1->name_len, m2->metric_name, m2->name_len);
+  return metric_names_cmp(m1->metric_name, m1->name_len, m2->metric_name, m2->name_len);
 }
 
 // Initialize fixed lookup table from configured delta metrics
@@ -143,7 +137,7 @@ static void init_delta_lookup(void) {
   }
   
   // Sort the array for binary search when we need to find a metric
-  qsort(u_dogstatsd_config.delta_lookup, count, sizeof(struct delta_metric), compare_delta_metrics);
+  qsort(u_dogstatsd_config.delta_lookup, count, sizeof(struct delta_metric), qsort_cmp);
 }
 
 // Get delta for metric (returns 0 if not found or first measurement)
@@ -151,7 +145,6 @@ static int64_t get_and_update_delta(const char *metric_name, uint32_t name_len, 
   struct delta_metric *entry = find_delta_metric(metric_name, name_len);
   
   if (entry) {
-    // Found - calculate delta and update
     int64_t delta = current_value - entry->prev_value;
     entry->prev_value = current_value;
     return delta;
@@ -272,12 +265,20 @@ static int dogstatsd_send_metric(struct uwsgi_buffer *ub, struct uwsgi_stats_pus
   // Check if this metric should use delta calculation
   int64_t value_to_send = value;
   if (u_dogstatsd_config.delta_lookup) {
-    char *metric_name_to_check = extracted_tags ? datatog_metric_name : (char *)metric;
-    uint32_t name_len_to_check = extracted_tags ? strlen(datatog_metric_name) : strlen(metric);
+    char *metric_name_to_check;
+    uint32_t name_len_to_check;
     
-    if (find_delta_metric(metric_name_to_check, name_len_to_check)) {
-      value_to_send = get_and_update_delta(metric_name_to_check, name_len_to_check, value);
+    if (extracted_tags > 0) {
+      // Tags were extracted, use the cleaned metric name
+      metric_name_to_check = datatog_metric_name;
+      name_len_to_check = strlen(datatog_metric_name);
+    } else {
+      // No tags extracted, use original metric name
+      metric_name_to_check = (char *)metric;
+      name_len_to_check = strlen(metric);
     }
+    
+    value_to_send = get_and_update_delta(metric_name_to_check, name_len_to_check, value);
   }
 
   if (uwsgi_buffer_append(ub, sn->prefix, sn->prefix_len)) return -1;

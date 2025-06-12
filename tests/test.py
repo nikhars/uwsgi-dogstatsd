@@ -2,7 +2,7 @@ import select
 import socket
 import sys
 import threading
-import urllib2
+import urllib.request as urllib2
 import copy
 from time import time, sleep
 
@@ -26,6 +26,7 @@ class Data(object):
 
     def parse_packet(self, packet):
         tags = None
+        print(packet)
         metadata = packet.split('|')
         if (len(metadata) < 2):
             raise Exception('Unparseable metric packet: %s' % packet)
@@ -57,7 +58,8 @@ class Data(object):
         self.dataLock.release()
 
     def new_packets(self, packets):
-        packets = unicode(packets, 'utf-8', errors='replace')
+        if isinstance(packets, bytes):
+            packets = packets.decode('utf-8', errors='replace')
         for packet in packets.splitlines():
             if not packet.strip():
                 continue
@@ -89,9 +91,12 @@ class Test(threading.Thread):
         'myapp.worker.core.requests'
     ]
 
+    DELTA_METRICS = [
+        'myapp.worker.respawns',
+    ]
+
     INC_METRICS = [
         'myapp.worker.total_tx',
-        'myapp.worker.respawns'
     ]
 
     VAL_METRICS = {
@@ -105,6 +110,7 @@ class Test(threading.Thread):
         self.success = 0
         self.failure = 0
         self.errors = []
+        self.delta_first_run = True
 
     def setExitValue(self, val):
         global exitValue
@@ -120,7 +126,7 @@ class Test(threading.Thread):
                 else:
                     self.setExitValue(1)
                     self.failure += 1
-                    self.errors.append(k)
+                    self.errors.append(k + f" Round {self.tests}, Old: {self.oldData[k]}, New: {attributes_changed[k]}")
 
             for k in self.INC_METRICS:
                 if k in attributes_changed and k in self.oldData and attributes_changed[k] >= self.oldData[k]:
@@ -128,45 +134,56 @@ class Test(threading.Thread):
                 else:
                     self.setExitValue(1)
                     self.failure += 1
-                    self.errors.append(k)
+                    self.errors.append(k + f" Round {self.tests}")
 
-            for k, v in self.VAL_METRICS.iteritems():
+            for k, v in self.VAL_METRICS.items():
                 if k in attributes_changed and k in self.oldData and v[0] <= attributes_changed[k] <= v[1]:
                     self.success += 1
                 else:
                     self.setExitValue(1)
                     self.failure += 1
-                    self.errors.append(k)
+                    self.errors.append(k + f" Round {self.tests}")
+
+            
+            # Test delta metrics
+            for k in self.DELTA_METRICS:
+                if k in attributes_changed:
+                    if attributes_changed[k] == 1:
+                        self.success += 1
+                    else:
+                        self.setExitValue(1)
+                        self.failure += 1
+                        self.errors.append(k + f" Round " + str(self.tests) + " (delta should be 1)")
 
         self.oldData = attributes_changed
 
     def printResult(self):
-        print "################################################################################"
-        print "RESULTS"
-        print "################################################################################"
-        print ""
-        print "SUCCESS: %d/%d" % (self.success, self.success + self.failure)
-        print ""
-        print "FAILURE: %d/%d" % (self.failure, self.success + self.failure)
-        print ""
-        print "################################################################################"
-        print ""
+        print("################################################################################")
+        print("RESULTS")
+        print("################################################################################")
+        print("")
+        print("SUCCESS: %d/%d" % (self.success, self.success + self.failure))
+        print("")
+        print("FAILURE: %d/%d" % (self.failure, self.success + self.failure))
+        print("")
+        print("################################################################################")
+        print("")
         if self.failure > 0:
-            print "Metrics failed:"
+            print("Metrics failed:")
             for m in self.errors:
-                print "* %s" % m
-            print ""
-            print "################################################################################"
+                print("* %s" % m)
+            print("")
+            print("################################################################################")
 
     def run(self):
-        print "TEST IN PROGRESS"
+        print("TEST IN PROGRESS")
         sleep(10)
         self.check()
         while self.tests > 0:
             ready = 0
             timeout = 30
             test = urllib2.urlopen("http://localhost:9090").read()
-            if test == "Hello World":
+            if test == b"Hello World":
                 while not ready and timeout > 0:
                     if self.data.ready():
                         ready = 1
@@ -177,9 +194,9 @@ class Test(threading.Thread):
                     self.check()
                     self.data.reset()
                 else:
-                    print "Test failed: cannot aggregate metrics change"
+                    print("Test failed: cannot aggregate metrics change")
             else:
-                print "Error while testing, please check if the web application is running"
+                print("Error while testing, please check if the web application is running")
             self.tests -= 1
         self.printResult()
         setExitFlag(1)
@@ -206,11 +223,11 @@ class Server(threading.Thread):
             self.socket.bind(self.address)
         except socket.gaierror:
             if self.address[0] == 'localhost':
-                log.warning("Warning localhost seems undefined in your host file, using 127.0.0.1 instead")
+                print("Warning localhost seems undefined in your host file, using 127.0.0.1 instead")
                 self.address = ('127.0.0.1', self.address[1])
                 self.socket.bind(self.address)
 
-        print "Listening on host & port: %s" % str(self.address)
+        print("Listening on host & port: %s" % str(self.address))
 
         sock = [self.socket]
         select_select = select.select
@@ -223,7 +240,7 @@ class Server(threading.Thread):
                     message = self.socket.recv(self.buffer_size)
                     self.data.new_packets(message)
             except Exception:
-                print 'Error receiving datagram'
+                print('Error receiving datagram')
 
 def main():
     data = Data()
@@ -235,7 +252,7 @@ def main():
         pass
     server.join()
     test.join()
-    print 'END TEST: Exiting'
+    print('END TEST: Exiting')
     return exitValue
 
 if __name__ == '__main__':
